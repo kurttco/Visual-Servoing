@@ -6,7 +6,7 @@
 ---
 
 ## 📹 Demo Video
-**[Watch on YouTube →](https://www.youtube.com/PLACEHOLDER)**
+**https://www.youtube.com/PLACEHOLDER**
 
 ---
 
