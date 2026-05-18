@@ -1,0 +1,144 @@
+# =============================================================================
+# safe_vs_params.yaml
+# Configuration for the PuzzleBot visual servoing demo.
+# TE3002B – Tecnológico de Monterrey
+#
+# HOW TO TUNE
+# -----------
+# 1. Start with default values.
+# 2. Run: ros2 topic echo /avoid_debug
+#    Watch the state and obstacle readings in real time.
+# 3. Adjust parameters section by section (camera, servo, avoidance).
+# 4. Never change k_lin / k_ang / max_wheel_cmd unless you recalibrate
+#    the drive model.
+# =============================================================================
+
+color_features_detector:
+  ros__parameters:
+
+    image_topic: "/video_source/raw"
+
+    # ── Green target HSV bounds ──────────────────────────────────────────
+    # Tune under your specific lighting:
+    #   $ ros2 run rqt_image_view rqt_image_view  (visualize segmentation)
+    green_h_min: 40
+    green_s_min: 50
+    green_v_min: 40
+    green_h_max: 90
+    green_s_max: 255
+    green_v_max: 255
+
+    # ── Blue obstacle HSV bounds ─────────────────────────────────────────
+    blue_h_min: 90
+    blue_s_min: 50
+    blue_v_min: 35
+    blue_h_max: 135
+    blue_s_max: 255
+    blue_v_max: 255
+
+    # ── Filtering ────────────────────────────────────────────────────────
+    min_target_area_px: 250.0     # ignore green blobs smaller than this
+    min_obstacle_area_px: 200.0   # ignore blue  blobs smaller than this
+    morph_kernel_size: 5          # morphological filter kernel (px)
+
+    roi_y_min_frac: 0.0           # restrict processing to this vertical
+    roi_y_max_frac: 1.0           # fraction of the frame (0.0–1.0)
+
+
+safe_vs_controller:
+  ros__parameters:
+
+    # ── Image geometry ───────────────────────────────────────────────────
+    image_width: 640
+    image_center_u: -1.0          # -1 → use image_width / 2
+
+    # ── Target servoing setpoint ─────────────────────────────────────────
+    # Calibrate sqrt_area_star at your desired stopping distance:
+    #   $ ros2 topic echo /target_features   (read sqrt_area when at goal)
+    sqrt_area_star: 850.0
+
+    target_area_deadband: 8.0           # px — deadband on sqrt_area error
+    target_center_deadband_px: 25.0     # px — deadband on lateral error
+
+    # ── Proportional servo gains ─────────────────────────────────────────
+    # kp_w: angular gain.  Higher → faster centering but more overshoot.
+    # kp_v: linear gain.   Higher → faster approach but more overshoot.
+    kp_w: 0.0025
+    kp_v: 0.0020
+
+    v_max: 0.18          # m/s — max forward speed during servo
+    w_max: 0.45          # rad/s — max angular speed
+    v_min_when_far: 0.035  # m/s — minimum forward speed when target is far
+
+    # ── Centering-scale band ─────────────────────────────────────────────
+    # Robot moves forward ONLY when |e_u| < v_stop_band_px.
+    # Outside this band: pure rotation (eliminates wave motion).
+    # Wider (80–100 px): smoother but slight residual wave.
+    # Narrower (40–50 px): very straight but more stop-start feel.
+    v_stop_band_px: 60.0
+
+    # ── Acquisition ──────────────────────────────────────────────────────
+    acquire_w: 0.30             # rad/s — spin speed while searching
+    feature_timeout_s: 0.8     # s — max age of a feature message
+
+    # ── Blue obstacle trigger (bumper) ───────────────────────────────────
+    obstacle_enable: true
+
+    # obstacle_min_sqrt_area: avoidance fires when obstacle appears at
+    # least this large.  Monitor /avoid_debug:
+    #   "too small" always → lower this value
+    #   triggers too early → raise this value
+    obstacle_min_sqrt_area: 150.0
+
+    obstacle_center_band_frac: 0.75  # fraction of image width for center band
+    obstacle_priority_over_lost: true  # avoid even if target is lost
+    avoid_cooldown_s: 1.0           # s — wait after avoidance before re-triggering
+
+    # ── APPROACH_OBSTACLE ────────────────────────────────────────────────
+    # Robot slowly advances toward the obstacle until it reaches
+    # approach_obs_sqrt_area in the frame, giving a consistent starting
+    # distance for the arc maneuver.
+    #
+    # CALIBRATE approach_obs_sqrt_area:
+    #   Place obstacle at desired approach distance.
+    #   $ ros2 topic echo /obstacle_features  (read sqrt_area)
+    #   Use that value here.
+    approach_obs_v: 0.07              # m/s — slow approach speed
+    approach_obs_kp_w: 0.0025        # angular gain for centering obstacle
+    approach_obs_sqrt_area: 350.0    # px — approach ends at this size
+    approach_obs_max_duration_s: 6.0 # s — safety timeout
+
+    # ── AVOID_ARC ────────────────────────────────────────────────────────
+    # Arc radius r = avoid_arc_v / avoid_arc_w (metres).
+    # Lateral displacement ≈ r · (1 − cos(w·t))
+    #
+    # Current values: r ≈ 0.07/0.35 = 0.20 m
+    #   After 4 s: angle = 0.35·4 = 1.4 rad → lateral ≈ 0.17 m (~17 cm)
+    #
+    # If the robot still clips the obstacle: raise avoid_arc_w or duration.
+    # If the arc feels too sharp: lower avoid_arc_w (wider radius).
+    avoid_arc_duration_s: 4.0
+    avoid_arc_v: 0.07          # m/s — forward speed during arc
+    avoid_arc_w: 0.35          # rad/s — turn rate during arc
+
+    # ── AVOID_RECENTER ───────────────────────────────────────────────────
+    # Counter-rotation to realign robot roughly toward target area.
+    # Increase duration if robot exits arc pointing too far away.
+    avoid_recenter_duration_s: 1.80
+    avoid_recenter_w: 0.67
+
+    # ── Hold ─────────────────────────────────────────────────────────────
+    hold_required_frames: 10   # frames within goal tolerance before HOLD
+
+    # ── Control loop ─────────────────────────────────────────────────────
+    control_rate_hz: 10.0
+    v_slew_rate: 0.20          # m/s/s  — max rate of change of v
+    w_slew_rate: 0.90          # rad/s/s — max rate of change of w
+
+
+cmd_vel_to_wheels:
+  ros__parameters:
+    # Drive model constants — do not change without recalibration.
+    k_lin: 0.074       # (m/s) per unit wheel command
+    k_ang: 0.561       # (rad/s) per unit wheel command
+    max_wheel_cmd: 2.8 # maximum wheel command magnitude
