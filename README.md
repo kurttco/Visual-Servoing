@@ -8,10 +8,6 @@
 ## 📹 Demo Video
 **[Watch on YouTube →](https://www.youtube.com/PLACEHOLDER)**
 
-## 📄 Technical Report
-Available in [`report/technical_report.tex`](report/technical_report.tex)
-Compile with: `pdflatex technical_report.tex` (two passes) or paste into [Overleaf](https://www.overleaf.com).
-
 ---
 
 ## Overview
