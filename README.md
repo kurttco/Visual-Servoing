@@ -27,28 +27,15 @@ puzzlebot_mc2/
 │
 ├── msg/
 │   ├── TargetFeatures.msg        # Image features of the green target
-│   ├── ObstacleFeatures.msg      # Image features of the blue obstacle
-│   ├── Goal.msg                  # (from other challenges, required by CMakeLists)
-│   └── SemaphoreState.msg        # (from other challenges, required by CMakeLists)
+│   └── ObstacleFeatures.msg      # Image features of the blue obstacle
 │
 ├── scripts/
 │   │
-│   │  ── Visual Servoing Demo (this project) ──
+│   │ 
 │   ├── safe_vs_controller.py     # Main controller: IBVS-MPC + obstacle avoidance FSM
 │   ├── color_features_detector.py # Vision node: HSV segmentation → feature messages
 │   ├── cmd_vel_to_wheels.py      # Converts /cmd_vel → /VelocitySetL, /VelocitySetR
-│   ├── plot_results.py           # Post-run analysis: reads CSV log → report figures
-│   │
-│   │  ── Other challenges (not used by VS demo) ──
-│   ├── odometry_node.py          # Wheel encoder → /robot_pose (used in MC2/MC3)
-│   ├── vs_controller.py          # Earlier MPC-only controller (no obstacle avoidance)
-│   ├── controller.py             # FSM controller from Mini Challenge 1-2
-│   ├── path_generator.py         # Waypoint generator
-│   ├── cmd_vel_bridge.py         # Alternative wheel bridge
-│   ├── analyze.py                # Data analysis utilities
-│   ├── traffic_light_detector.py # Traffic light state detector
-│   ├── hsv_calibrator.py         # Interactive HSV tuning tool
-│   └── target_detector.py        # Earlier single-target detector
+│   └── plot_results.py           # Post-run analysis: reads CSV log → report figures
 │
 ├── launch/
 │   └── safe_vs_demo.launch.py    # Launches the full VS demo (3 nodes)
@@ -60,11 +47,6 @@ puzzlebot_mc2/
 ├── CMakeLists.txt
 └── package.xml
 ```
-
-> **For the VS demo, only these files matter:**  
-> `safe_vs_controller.py`, `color_features_detector.py`, `cmd_vel_to_wheels.py`,  
-> `safe_vs_demo.launch.py`, `safe_vs_params.yaml`, `msg/TargetFeatures.msg`, `msg/ObstacleFeatures.msg`
-
 ---
 
 ## Dependencies
