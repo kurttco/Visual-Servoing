@@ -1,28 +1,22 @@
 # Optimal Control for Visual Servoing — PuzzleBot
-**TE3002B · Tecnológico de Monterrey**
 
-> Closed-loop Image-Based Visual Servoing (IBVS) with obstacle avoidance on a PuzzleBot differential drive robot, using only a forward-facing camera.
-
----
-
-## 📹 Demo Video
-**https://www.youtube.com/PLACEHOLDER**
+**Course:** TE3002B — Mobile Robotics and Computer Vision  
+**Institution:** Tecnológico de Monterrey  
+**Team:** Ferro M., Banda F., Ortega Z., Cárdenas A., Proal F.
 
 ---
 
 ## Overview
 
-The robot uses classical computer vision (HSV segmentation) to detect a **green target** and a **blue obstacle**. It servo-controls toward the target using an IBVS proportional controller derived from a Model Predictive Control formulation. When an obstacle is detected ahead, it executes an **approach-then-arc** avoidance maneuver:
+This repository contains the full implementation of a closed-loop visual servoing pipeline on the PuzzleBot differential drive robot. The robot uses only its forward-facing camera to navigate toward a colored target while detecting and avoiding a colored obstacle placed in its path.
 
-1. **Stop** completely
-2. **Approach** the obstacle slowly while centering it — establishes a known distance
-3. **Arc** smoothly around it
-4. **Reacquire** the target and continue
+**Key features:**
+- Classical HSV color segmentation (no neural networks)
+- Image-Based Visual Servoing (IBVS) formulated as a finite-horizon MPC and solved as a QP with OSQP at 10 Hz
+- Visual-feedback obstacle avoidance: approach-then-square-bypass strategy
+- Full FSM with logging, parameter-driven tuning, and result plot generation
 
-```
-Camera → [Detector] → features → [Controller] → /cmd_vel → [Wheels] → Robot
-                                      ↑___________________feedback___________|
-```
+**Demo video:** https://youtu.be/xGdBGcd0faU
 
 ---
 
@@ -30,42 +24,77 @@ Camera → [Detector] → features → [Controller] → /cmd_vel → [Wheels] �
 
 ```
 puzzlebot_mc2/
+│
+├── msg/
+│   ├── TargetFeatures.msg        # Image features of the green target
+│   ├── ObstacleFeatures.msg      # Image features of the blue obstacle
+│   ├── Goal.msg                  # (from other challenges, required by CMakeLists)
+│   └── SemaphoreState.msg        # (from other challenges, required by CMakeLists)
+│
 ├── scripts/
-│   ├── safe_vs_controller.py       # Main controller (IBVS + avoidance FSM)
-│   ├── color_features_detector.py  # HSV segmentation → image features
-│   └── cmd_vel_to_wheels.py        # /cmd_vel → wheel velocity setpoints
-├── config/
-│   └── safe_vs_params.yaml         # All tunable parameters (documented)
+│   │
+│   │  ── Visual Servoing Demo (this project) ──
+│   ├── safe_vs_controller.py     # Main controller: IBVS-MPC + obstacle avoidance FSM
+│   ├── color_features_detector.py # Vision node: HSV segmentation → feature messages
+│   ├── cmd_vel_to_wheels.py      # Converts /cmd_vel → /VelocitySetL, /VelocitySetR
+│   ├── plot_results.py           # Post-run analysis: reads CSV log → report figures
+│   │
+│   │  ── Other challenges (not used by VS demo) ──
+│   ├── odometry_node.py          # Wheel encoder → /robot_pose (used in MC2/MC3)
+│   ├── vs_controller.py          # Earlier MPC-only controller (no obstacle avoidance)
+│   ├── controller.py             # FSM controller from Mini Challenge 1-2
+│   ├── path_generator.py         # Waypoint generator
+│   ├── cmd_vel_bridge.py         # Alternative wheel bridge
+│   ├── analyze.py                # Data analysis utilities
+│   ├── traffic_light_detector.py # Traffic light state detector
+│   ├── hsv_calibrator.py         # Interactive HSV tuning tool
+│   └── target_detector.py        # Earlier single-target detector
+│
 ├── launch/
-│   └── safe_vs_demo.launch.py      # Launches all three nodes
-├── report/
-│   └── technical_report.tex        # IEEE-format technical report (LaTeX)
-└── README.md
+│   └── safe_vs_demo.launch.py    # Launches the full VS demo (3 nodes)
+│
+├── config/
+│   ├── safe_vs_params.yaml       # All parameters for the VS demo
+│   └── robot_params.yaml         # Physical robot parameters (odometry)
+│
+├── CMakeLists.txt
+└── package.xml
 ```
+
+> **For the VS demo, only these files matter:**  
+> `safe_vs_controller.py`, `color_features_detector.py`, `cmd_vel_to_wheels.py`,  
+> `safe_vs_demo.launch.py`, `safe_vs_params.yaml`, `msg/TargetFeatures.msg`, `msg/ObstacleFeatures.msg`
 
 ---
 
-## Prerequisites
+## Dependencies
 
-| Requirement | Version |
-|---|---|
-| Ubuntu | 22.04 |
-| ROS 2 | Humble Hawksbill |
-| Python | 3.10+ |
-| OpenCV | 4.x (`cv_bridge`) |
+**ROS 2:** Humble Hawksbill  
+**OS:** Ubuntu 22.04 (tested on Jetson Nano)
 
-The `puzzlebot_mc2` package must already be set up in your ROS 2 workspace with the custom messages (`TargetFeatures`, `ObstacleFeatures`).
+Python packages:
+
+```bash
+pip install qpsolvers[osqp] numpy scipy --break-system-packages
+pip install opencv-python --break-system-packages   # if not already present
+```
+
+ROS 2 packages (should already be installed on PuzzleBot image):
+
+```
+rclpy  std_msgs  geometry_msgs  sensor_msgs  cv_bridge
+```
 
 ---
 
 ## Installation
 
 ```bash
-# 1. Clone into your ROS 2 workspace source directory
+# Clone into your ROS 2 workspace
 cd ~/ros2_ws/src
-git clone https://github.com/PLACEHOLDER/puzzlebot-vs.git puzzlebot_mc2
+git clone https://github.com/kurttco/Visual-Servoing.git puzzlebot_mc2
 
-# 2. Build
+# Build
 cd ~/ros2_ws
 colcon build --packages-select puzzlebot_mc2
 source install/setup.bash
@@ -73,179 +102,171 @@ source install/setup.bash
 
 ---
 
-## Running
+## Running the Demo
 
 ```bash
-# Source your workspace (if not in .bashrc already)
-source ~/ros2_ws/install/setup.bash
-
-# Launch everything (detector + controller + wheel driver)
 ros2 launch puzzlebot_mc2 safe_vs_demo.launch.py
 ```
 
-That single command starts all three nodes with the parameters from `config/safe_vs_params.yaml`.
+This starts three nodes:
+
+| Node | Script | Role |
+|---|---|---|
+| `color_features_detector` | `color_features_detector.py` | Camera → HSV → feature messages |
+| `safe_vs_controller` | `safe_vs_controller.py` | MPC + FSM + avoidance |
+| `cmd_vel_to_wheels` | `cmd_vel_to_wheels.py` | `/cmd_vel` → wheel commands |
+
+**Monitor in real time:**
+
+```bash
+# FSM state
+ros2 topic echo /vs_state
+
+# Detailed debug per tick (state, danger flag, obstacle size, etc.)
+ros2 topic echo /avoid_debug
+
+# Target and obstacle detections
+ros2 topic echo /target_features
+ros2 topic echo /obstacle_features
+```
+
+**CSV log** is written automatically to `/tmp/puzzlebot_logs/run_<timestamp>.csv` at 10 Hz. Use this to generate the result plots after a run.
 
 ---
 
-## Monitoring in Real Time
-
-Open separate terminals for each:
+## Generating Result Plots
 
 ```bash
-# FSM state (ACQUIRE / SERVO / APPROACH_OBSTACLE / AVOID_ARC / ...)
-ros2 topic echo /vs_state
+# On the Jetson — copy the log to your laptop
+scp puzzlebot@<JETSON_IP>:/tmp/puzzlebot_logs/run_*.csv ./
 
-# Human-readable debug: state, danger flag, obstacle size, reason
-ros2 topic echo /avoid_debug
+# Generate the three report figures
+python3 scripts/plot_results.py run_<timestamp>.csv --out ./figures/
+```
 
-# Raw target features (u_c, sqrt_area, detected, solidity)
-ros2 topic echo /target_features
+This produces:
 
-# Raw obstacle features
-ros2 topic echo /obstacle_features
+| File | Contents |
+|---|---|
+| `fig_errors.png` | Feature errors eᵤ and e_A during SERVO phases |
+| `fig_avoidance.png` | Obstacle apparent size and FSM state trace |
+| `fig_cmds.png` | Commanded v and ω over the full run |
 
-# Velocity commands being sent
-ros2 topic echo /cmd_vel
+Optional arguments:
+
+```bash
+python3 plot_results.py run.csv \
+  --obs-trigger  150   \   # obstacle_min_sqrt_area in your yaml
+  --obs-approach 350   \   # approach_obs_sqrt_area in your yaml
+  --out ./figures/
 ```
 
 ---
 
-## Tuning Guide
+## Key Parameters (`safe_vs_params.yaml`)
 
-All parameters live in `config/safe_vs_params.yaml`. No code changes are needed for tuning.
+### Calibration — do these first
 
-### Step 1 — Calibrate the target setpoint
+| Parameter | Where to calibrate | What it controls |
+|---|---|---|
+| `sqrt_area_star` | Place robot at goal distance, read `sqrt_area` from `/target_features` | Desired standoff |
+| `focal_length_px` | Place target at 1.0 m, read `sqrt_area`, compute `f = sqrt_area / target_real_side_m` | MPC depth model |
+| `square_turn_duration_s` | Command the robot to spin in place and time 90° | Turn accuracy in bypass |
 
-Place the robot at the exact desired stopping distance from the green target. Run the stack and read `sqrt_area` from `/target_features`. Set that value as `sqrt_area_star`.
+### MPC weights
 
-### Step 2 — Tune HSV bounds
+| Parameter | Default | Effect of raising |
+|---|---|---|
+| `Q_u` | 1.0 | Faster lateral centering |
+| `Q_A` | 5.0 | Faster depth convergence |
+| `R_v` | 30000.0 | More conservative forward speed |
+| `R_w` | 5000.0 | More conservative turning |
+| `S_v / S_w` | 50.0 | Smoother command transitions |
 
-Lighting changes will shift hue/saturation values. Run with `rqt_image_view` to visualize the segmentation mask, or echo `/target_features` and `/obstacle_features` while moving the target/obstacle into frame. Adjust `green_h_min/max` and `blue_h_min/max` until detection is clean.
+### Obstacle avoidance
 
-### Step 3 — Tune servo gains
-
-Watch `/avoid_debug` with the robot approaching the target:
-- **Wavy path** → lower `kp_w` or lower `v_stop_band_px`
-- **Too slow to center** → raise `kp_w`
-- **Oscillates around goal** → lower `kp_v` or raise `target_area_deadband`
-
-### Step 4 — Tune obstacle trigger
-
-Watch `/avoid_debug` as the robot approaches the obstacle:
-- `"too small"` always showing → lower `obstacle_min_sqrt_area`
-- Avoidance fires too far away → raise `obstacle_min_sqrt_area`
-
-### Step 5 — Calibrate approach endpoint
-
-Place the obstacle at the distance where you want the arc to start. Read `sqrt_area` from `/obstacle_features`. Set that as `approach_obs_sqrt_area`.
-
-### Step 6 — Tune the arc
-
-The arc radius is `r = avoid_arc_v / avoid_arc_w`. Lateral displacement is approximately `r · (1 − cos(avoid_arc_w · avoid_arc_duration_s))`.
-
-- **Robot clips obstacle** → raise `avoid_arc_w` (tighter radius) or increase `avoid_arc_duration_s`
-- **Arc too sharp / aggressive** → lower `avoid_arc_w` (wider radius)
-- **Robot doesn't reacquire target** → increase `avoid_recenter_duration_s`
+| Parameter | Default | Notes |
+|---|---|---|
+| `obstacle_min_sqrt_area` | 150 | Lower = avoidance triggers earlier (more room) |
+| `obstacle_center_band_frac` | 0.90 | Fraction of image width that activates avoidance |
+| `approach_obs_sqrt_area` | 350 | Target apparent size before bypass begins (calibrate at desired approach distance) |
+| `square_turn_duration_s` | 3.5 | Calibrate to achieve exactly 90° on your robot |
+| `square_leg_1_duration_s` | 2.5 | Lateral clearance: `Δy ≈ v_leg × t_leg1` |
+| `square_leg_2_duration_s` | 3.0 | Forward clearance: `Δx ≈ v_leg × t_leg2` |
 
 ---
 
 ## System Architecture
 
-### Nodes and Topics
-
 ```
-/video_source/raw  (sensor_msgs/Image)
-        │
-        ▼
-[color_features_detector]
-        │
-        ├─── /target_features   (puzzlebot_mc2/TargetFeatures)
-        └─── /obstacle_features (puzzlebot_mc2/ObstacleFeatures)
-                        │
-                        ▼
-              [safe_vs_controller]
-                        │
-                        └─── /cmd_vel (geometry_msgs/Twist)
-                                  │
-                                  ▼
-                       [cmd_vel_to_wheels]
-                                  │
-                        ┌─────────┴──────────┐
-                        ▼                    ▼
-               /VelocitySetL        /VelocitySetR
-               (std_msgs/Float32)   (std_msgs/Float32)
+Camera ──► color_features_detector ──► /target_features  ──► safe_vs_controller ──► /cmd_vel ──► cmd_vel_to_wheels
+                                   └──► /obstacle_features ─►                                          │
+                                                                                                       ▼
+                                   ◄────────────────── visual feedback ──────────── /VelocitySetL/R → PuzzleBot
 ```
 
-### FSM States
-
-| State | Description |
-|---|---|
-| `ACQUIRE` | Rotate in place until green target is found |
-| `SERVO` | IBVS proportional control toward green target |
-| `PRE_AVOID_STOP` | Full stop before avoidance maneuver |
-| `APPROACH_OBSTACLE` | Center and advance toward blue obstacle to get visual fix |
-| `AVOID_ARC` | Smooth arc around the obstacle |
-| `AVOID_RECENTER` | Counter-rotation to realign with target area |
-| `REACQUIRE` | Search for target after avoidance |
-| `HOLD` | Goal reached — stop and hold |
-| `LOST` | Target disappeared — search again |
-
-### Control Law
-
-The proportional IBVS law with centering-scale coupling:
+### FSM states
 
 ```
-e_u = u_c - c_x                          (lateral error, pixels)
-e_A = sqrt_area_star - sqrt_area          (area error, pixels)
-
-w = -kp_w * e_u                           (angular command)
-v = kp_v * e_A                            (forward command, before scaling)
-
-# Centering-scale: eliminate wave motion
-if |e_u| > v_stop_band_px:
-    v = 0                                 (pure rotation when off-center)
-else:
-    v = v * (1 - |e_u| / v_stop_band_px) (linear ramp near center)
+ACQUIRE ──► SERVO ──► PRE_AVOID_STOP ──► APPROACH_OBSTACLE
+              │                                  │
+              ├──► HOLD                     SQ_TURN_1
+              │                                  │
+              └──► LOST                     SQ_LEG_1
+                                                 │
+                                           SQ_TURN_2
+                                                 │
+                                           SQ_LEG_2
+                                                 │
+                                           REACQUIRE ──► SERVO
 ```
 
 ---
 
-## Key Parameters Reference
+## How the Controller Works
 
-| Parameter | Default | Effect |
-|---|---|---|
-| `sqrt_area_star` | 850 px | Target stopping distance |
-| `kp_w` | 0.0025 | Angular servo gain |
-| `kp_v` | 0.0020 | Linear servo gain |
-| `v_stop_band_px` | 60 px | Centering band width |
-| `obstacle_min_sqrt_area` | 150 px | Obstacle trigger threshold |
-| `approach_obs_sqrt_area` | 350 px | Approach endpoint |
-| `approach_obs_v` | 0.07 m/s | Approach speed |
-| `avoid_arc_v` | 0.07 m/s | Arc forward speed |
-| `avoid_arc_w` | 0.35 rad/s | Arc turn rate |
-| `avoid_arc_duration_s` | 4.0 s | Arc duration |
+### Vision pipeline
+
+Each camera frame is converted to HSV. Binary masks are generated separately for the green target and blue obstacle using configurable HSV bounds. After morphological filtering, the largest contour in each mask is selected and three features are extracted: horizontal centroid `u_c`, apparent size `√A`, and solidity. These are published as `TargetFeatures` and `ObstacleFeatures` messages at the camera frame rate.
+
+### IBVS-MPC
+
+The controller minimizes a quadratic cost over image feature errors across a prediction horizon of N=8 steps, subject to actuator limits. The image Jacobian **L** maps velocity commands `[v, ω]` to predicted feature changes `[u̇_c, √Ȧ]` and is re-evaluated at every tick from the current measurement. The resulting QP is solved with OSQP in under 10 ms.
+
+### Obstacle avoidance
+
+When the obstacle appears large and centered in the image, the robot stops, slowly approaches the obstacle while centering it in the frame, and then executes a two-turn, two-leg rectangular detour. The arc direction is determined from the obstacle's lateral position at the moment the approach threshold is reached, giving the controller the most reliable visual fix possible before committing to the maneuver.
 
 ---
 
 ## Troubleshooting
 
-**Robot doesn't detect the target**
-→ Check `green_h_min/max` under your lighting. Echo `/target_features` and look at the `detected` field.
+**`color_features_detector` not publishing:**  
+Check the image topic. The detector defaults to `/video_source/raw`. Verify with:
+```bash
+ros2 node info /color_features_detector   # look at Subscribers
+ros2 topic hz /video_source/raw           # check camera is running
+```
 
-**Robot detects target but doesn't move**
-→ Check `sqrt_area_star`. If `sqrt_area` is already >= `sqrt_area_star`, the robot thinks it's at the goal.
+**Build fails with `Goal.msg doesn't exist`:**  
+You are running `colcon build` from the wrong directory. Run it from `~/ros2_ws`, not from your home folder:
+```bash
+cd ~/ros2_ws && colcon build --packages-select puzzlebot_mc2
+```
 
-**Avoidance never triggers**
-→ Echo `/avoid_debug`. If it says `"too small"`, lower `obstacle_min_sqrt_area`. If it says `"outside band"`, the obstacle may be approaching at an angle — check `obstacle_center_band_frac`.
+**MPC import error (`qpsolvers not found`):**  
+```bash
+pip install qpsolvers[osqp] --break-system-packages
+```
 
-**Robot clips the obstacle during the arc**
-→ Raise `avoid_arc_w` to tighten the arc radius, or raise `avoid_arc_duration_s` to extend the arc further past the obstacle.
+**Robot spins in place during SERVO:**  
+`sqrt_area_star` is set too high — the target never appears large enough to satisfy the goal condition, so the robot keeps trying to approach but the centering error prevents forward motion. Place the robot at the desired stopping distance and read `√A` from `/target_features`.
 
-**Robot doesn't reacquire target after avoidance**
-→ Increase `avoid_recenter_duration_s` so the robot turns further back toward the target area.
+**Avoidance triggers too late (robot too close to obstacle):**  
+Lower `obstacle_min_sqrt_area`. The current value requires the obstacle to appear at a minimum size before avoidance fires; reducing it causes earlier triggering with more physical clearance room.
 
 ---
 
 ## License
 
-Academic project — Tecnológico de Monterrey, 2025.
+MIT
