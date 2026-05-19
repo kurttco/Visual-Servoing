@@ -247,8 +247,3 @@ pip install qpsolvers[osqp] --break-system-packages
 **Avoidance triggers too late (robot too close to obstacle):**  
 Lower `obstacle_min_sqrt_area`. The current value requires the obstacle to appear at a minimum size before avoidance fires; reducing it causes earlier triggering with more physical clearance room.
 
----
-
-## License
-
-MIT
