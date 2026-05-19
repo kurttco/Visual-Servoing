@@ -1,233 +1,419 @@
 #!/usr/bin/env python3
 """
-safe_vs_controller.py
-======================
-Visual servoing controller for the PuzzleBot (Manchester Robotics).
-Part of: TE3002B – Mobile Robotics and Computer Vision
-         Tecnológico de Monterrey
+safe_vs_controller.py  — IBVS-MPC edition
+------------------------------------------
+Visual servoing controller with finite-horizon MPC and square-bypass
+obstacle avoidance.
 
-OVERVIEW
---------
-Implements a closed-loop Image-Based Visual Servoing (IBVS) pipeline:
+The servoing law is a full IBVS-MPC: at each tick the QP is solved over a
+horizon of N steps, the optimal first command is applied, and the problem is
+re-solved at the next step with a fresh measurement (receding horizon).
 
-  1. Receives image features from /target_features and /obstacle_features
-  2. Runs a proportional IBVS control law (derived from an MPC formulation)
-  3. Applies a centering-scale coupling to eliminate oscillatory approach
-  4. Executes an approach-then-arc obstacle avoidance maneuver when needed
-  5. Publishes velocity commands to /cmd_vel
+All FSM logic, obstacle avoidance, and CSV logging are unchanged.
 
-COLLISION AVOIDANCE MODEL
---------------------------
-When a blue obstacle is detected ahead, the robot:
-  (a) Stops completely            [PRE_AVOID_STOP]
-  (b) Slowly approaches obstacle  [APPROACH_OBSTACLE]
-      - Centers it in the camera using visual feedback
-      - Advances until sqrt(A_obs) >= approach_obs_sqrt_area
-      - This establishes a consistent, known starting distance
-  (c) Executes a smooth arc       [AVOID_ARC]
-      - Direction decided from obstacle position at arc start
-  (d) Counter-rotates to realign  [AVOID_RECENTER]
-  (e) Searches for target again   [REACQUIRE]
-
-FSM STATES
-----------
-  ACQUIRE -> SERVO -> PRE_AVOID_STOP -> APPROACH_OBSTACLE
-          -> AVOID_ARC -> AVOID_RECENTER -> REACQUIRE -> SERVO
-  SERVO   -> HOLD  (goal reached)
-  SERVO   -> LOST  -> ACQUIRE
-
-SUBSCRIPTIONS
--------------
-  /target_features    puzzlebot_mc2/TargetFeatures
-  /obstacle_features  puzzlebot_mc2/ObstacleFeatures
-
-PUBLICATIONS
-------------
-  /cmd_vel            geometry_msgs/Twist
-  /vs_state           std_msgs/String
-  /avoid_debug        std_msgs/String    (human-readable debug info)
-
-PARAMETERS  (see config/safe_vs_params.yaml for full list and comments)
-----------
-  See Parameter sections below.
+Requirements:
+  pip install qpsolvers[osqp] --break-system-packages
 """
 
+import csv
+import os
+import time as time_mod
 from enum import Enum
+
+import numpy as np
+import scipy.sparse as sp
+
+try:
+    from qpsolvers import solve_qp
+except ImportError as exc:
+    raise SystemExit(
+        'qpsolvers not found. Install with:\n'
+        '  pip install qpsolvers[osqp] --break-system-packages'
+    ) from exc
 
 import rclpy
 from rclpy.node import Node
+
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 
 from puzzlebot_mc2.msg import TargetFeatures, ObstacleFeatures
 
 
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
 def clip(x, lo, hi):
-    """Clamp x to the interval [lo, hi]."""
     return max(lo, min(hi, x))
 
 
-# ---------------------------------------------------------------------------
-# FSM State Enum
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# IBVS-MPC solver
+# ═══════════════════════════════════════════════════════════════════════════
+
+class IBVS_MPC:
+    """
+    Finite-horizon Image-Based Visual Servoing MPC.
+
+    State:   s = [u_c, sqrt_A]   (image features)
+    Control: u = [v, omega]       (diff-drive velocities)
+
+    Cost (Eq. 2 in the report):
+        J = sum_{k=1}^{N}  ds_k' Q ds_k  +  u_k' R u_k  +  Du_k' S Du_k
+
+    Constraints:
+        |v|     <= v_max
+        |omega| <= omega_max
+        |v|/k_lin + |omega|/k_ang <= max_cmd_couple   (bridge coupling)
+
+    The QP is solved with OSQP via qpsolvers at every control tick.
+    The first element of the optimal sequence is applied (receding horizon).
+    """
+
+    def __init__(self, N, dt, f, cx, sqrt_A_real,
+                 v_max, omega_max, k_lin, k_ang, max_cmd_couple,
+                 Q, R, S):
+        self.N            = int(N)
+        self.dt           = float(dt)
+        self.f            = float(f)
+        self.cx           = float(cx)
+        self.sqrt_A_real  = float(sqrt_A_real)
+        self.v_max        = float(v_max)
+        self.omega_max    = float(omega_max)
+        self.k_lin        = float(k_lin)
+        self.k_ang        = float(k_ang)
+        self.max_couple   = float(max_cmd_couple)
+        self.Q            = np.asarray(Q, dtype=float).reshape(2, 2)
+        self.R            = np.asarray(R, dtype=float).reshape(2, 2)
+        self.S            = np.asarray(S, dtype=float).reshape(2, 2)
+
+        n = 2 * self.N
+
+        # ── slew penalty matrix  D  ───────────────────────────────────────
+        D = np.zeros((n, n))
+        I2 = np.eye(2)
+        for k in range(self.N):
+            D[2*k:2*k+2, 2*k:2*k+2] = I2
+            if k > 0:
+                D[2*k:2*k+2, 2*(k-1):2*(k-1)+2] = -I2
+        I_S = np.kron(np.eye(self.N), self.S)
+        I_R = np.kron(np.eye(self.N), self.R)
+        # base Hessian (only R and S parts; Q part added per-step)
+        self._H_base = 2.0 * (I_R + D.T @ I_S @ D)
+        self._D      = D
+        self._I_S    = I_S
+
+        # ── coupled actuator constraints  G u <= h ────────────────────────
+        a = 1.0 / self.k_lin
+        b = 1.0 / self.k_ang
+        rows, rhs = [], []
+        for k in range(self.N):
+            for sv, so in [(+1,+1),(+1,-1),(-1,+1),(-1,-1)]:
+                row = np.zeros(n)
+                row[2*k]   = sv * a
+                row[2*k+1] = so * b
+                rows.append(row)
+                rhs.append(self.max_couple)
+        self._G = np.array(rows)
+        self._h = np.array(rhs)
+
+        # ── box constraints ───────────────────────────────────────────────
+        self._lb = np.tile([-self.v_max,    -self.omega_max], self.N)
+        self._ub = np.tile([ self.v_max,     self.omega_max], self.N)
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _jacobian(self, u_c, sqrt_A):
+        """
+        2×2 image Jacobian  L  for a differential-drive robot.
+        Maps [v, omega] -> d/dt [u_c, sqrt_A].
+
+            L = [ e_u/Z ,  f + e_u^2/f  ]
+                [ sA/Z  ,  0            ]
+
+        Depth Z estimated from apparent area using the pinhole model (Eq. 2).
+        """
+        e_u = u_c - self.cx
+        # depth estimate; clamped to avoid singularity
+        Z = max((self.sqrt_A_real * self.f) / max(float(sqrt_A), 1.0), 0.20)
+        return np.array([
+            [e_u / Z,       self.f + e_u**2 / self.f],
+            [sqrt_A / Z,    0.0                      ],
+        ], dtype=float)
+
+    # ── main solver ──────────────────────────────────────────────────────
+
+    def solve(self, s_now, s_star, u_prev):
+        """
+        Solve the IBVS-MPC QP and return the first optimal command.
+
+        Parameters
+        ----------
+        s_now  : [u_c, sqrt_A]        current image features
+        s_star : [cx,  sqrt_A_star]   desired features
+        u_prev : [v_prev, w_prev]     previous command (for slew term)
+
+        Returns
+        -------
+        (v_cmd, w_cmd)  — first element of the optimal sequence
+        """
+        s_now  = np.asarray(s_now,  dtype=float).reshape(2)
+        s_star = np.asarray(s_star, dtype=float).reshape(2)
+        u_prev = np.asarray(u_prev, dtype=float).reshape(2)
+
+        L    = self._jacobian(s_now[0], s_now[1])
+        L_dt = self.dt * L
+        ds0  = s_now - s_star
+        n    = 2 * self.N
+
+        # ── build Hessian and gradient ────────────────────────────────────
+        H_s = np.zeros((n, n))
+        g_s = np.zeros(n)
+        for k in range(1, self.N + 1):
+            # M_k maps the full control sequence U to ds at step k
+            M_k = np.zeros((2, n))
+            for i in range(k):
+                M_k[:, 2*i:2*i+2] = L_dt
+            H_s += 2.0 * M_k.T @ self.Q @ M_k
+            g_s += 2.0 * M_k.T @ self.Q @ ds0
+
+        H = self._H_base + H_s
+
+        # slew gradient term
+        c      = np.zeros(n)
+        c[0:2] = u_prev
+        g = g_s - 2.0 * self._D.T @ self._I_S @ c
+
+        # symmetrise and regularise for numerical safety
+        H = 0.5 * (H + H.T) + 1e-6 * np.eye(n)
+
+        try:
+            U = solve_qp(
+                sp.csc_matrix(H), g,
+                self._G, self._h,
+                lb=self._lb, ub=self._ub,
+                solver='osqp',
+                verbose=False,
+            )
+        except Exception:
+            return 0.0, 0.0
+
+        if U is None:
+            return 0.0, 0.0
+
+        return float(U[0]), float(U[1])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FSM
+# ═══════════════════════════════════════════════════════════════════════════
 
 class State(Enum):
-    ACQUIRE           = 0
-    SERVO             = 1
-    PRE_AVOID_STOP    = 2
+    ACQUIRE = 0
+    SERVO = 1
+    PRE_AVOID_STOP = 2
     APPROACH_OBSTACLE = 3
-    AVOID_ARC         = 4
-    AVOID_RECENTER    = 5
-    REACQUIRE         = 6
-    HOLD              = 7
-    LOST              = 8
+    SQ_TURN_1 = 4
+    SQ_LEG_1 = 5
+    SQ_TURN_2 = 6
+    SQ_LEG_2 = 7
+    REACQUIRE = 8
+    HOLD = 9
+    LOST = 10
 
 
-# ---------------------------------------------------------------------------
-# Main Node
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# Main node
+# ═══════════════════════════════════════════════════════════════════════════
 
 class SafeVSController(Node):
 
     def __init__(self):
         super().__init__('safe_vs_controller')
 
-        # ── Image geometry ────────────────────────────────────────────────
+        # ── image geometry ────────────────────────────────────────────────
         self.declare_parameter('image_width', 640)
-        self.declare_parameter('image_center_u', -1.0)  # <0 → use width/2
+        self.declare_parameter('image_center_u', -1.0)
 
-        # ── Target servoing ───────────────────────────────────────────────
+        # ── camera / target model (needed by MPC Jacobian) ────────────────
+        self.declare_parameter('focal_length_px', 600.0)
+        self.declare_parameter('target_real_side_m', 0.15)
+
+        # ── target servoing setpoint ──────────────────────────────────────
         self.declare_parameter('sqrt_area_star', 850.0)
         self.declare_parameter('target_area_deadband', 8.0)
         self.declare_parameter('target_center_deadband_px', 25.0)
-        self.declare_parameter('kp_w', 0.0025)
-        self.declare_parameter('kp_v', 0.0020)
+
+        # ── MPC weights and horizon ───────────────────────────────────────
+        self.declare_parameter('mpc_horizon_N', 8)
+        self.declare_parameter('mpc_dt_s', 0.10)
+        self.declare_parameter('Q_u',  1.0)       # lateral error weight
+        self.declare_parameter('Q_A',  5.0)       # area (depth) error weight
+        self.declare_parameter('R_v',  30000.0)   # forward velocity cost
+        self.declare_parameter('R_w',  5000.0)    # angular velocity cost
+        self.declare_parameter('S_v',  50.0)      # forward slew cost
+        self.declare_parameter('S_w',  50.0)      # angular slew cost
+
+        # ── actuator limits ───────────────────────────────────────────────
         self.declare_parameter('v_max', 0.18)
         self.declare_parameter('w_max', 0.45)
-        self.declare_parameter('v_min_when_far', 0.035)
+        self.declare_parameter('k_lin', 0.074)
+        self.declare_parameter('k_ang', 0.561)
+        self.declare_parameter('max_cmd_couple', 2.8)
 
-        # Centering-scale band.  When lateral error |e_u| > v_stop_band_px,
-        # forward speed is set to zero and the robot only rotates.
-        # This eliminates the oscillatory wave motion in the servo phase.
-        self.declare_parameter('v_stop_band_px', 60.0)
-
-        # ── Acquisition / timeout ─────────────────────────────────────────
+        # ── acquisition / timeout ─────────────────────────────────────────
         self.declare_parameter('acquire_w', 0.30)
         self.declare_parameter('feature_timeout_s', 0.8)
 
-        # ── Blue obstacle trigger ─────────────────────────────────────────
+        # ── blue obstacle trigger ─────────────────────────────────────────
         self.declare_parameter('obstacle_enable', True)
         self.declare_parameter('obstacle_min_sqrt_area', 150.0)
-        self.declare_parameter('obstacle_center_band_frac', 0.75)
+        self.declare_parameter('obstacle_center_band_frac', 0.90)
         self.declare_parameter('obstacle_priority_over_lost', True)
-        self.declare_parameter('avoid_cooldown_s', 1.0)
+        self.declare_parameter('avoid_cooldown_s', 2.0)
 
-        # ── APPROACH_OBSTACLE ─────────────────────────────────────────────
+        # ── approach phase ────────────────────────────────────────────────
         self.declare_parameter('approach_obs_v', 0.07)
         self.declare_parameter('approach_obs_kp_w', 0.0025)
         self.declare_parameter('approach_obs_sqrt_area', 350.0)
         self.declare_parameter('approach_obs_max_duration_s', 6.0)
 
-        # ── AVOID_ARC ─────────────────────────────────────────────────────
-        # arc radius r = v/w.  Higher w → tighter radius → more lateral
-        # displacement.  Tune arc_w first to achieve physical clearance,
-        # then adjust arc_duration for how far past the obstacle to travel.
-        self.declare_parameter('avoid_arc_duration_s', 4.0)
-        self.declare_parameter('avoid_arc_v', 0.07)
-        self.declare_parameter('avoid_arc_w', 0.35)
+        # ── square bypass ─────────────────────────────────────────────────
+        self.declare_parameter('square_turn_w', 0.45)
+        self.declare_parameter('square_turn_duration_s', 3.5)
+        self.declare_parameter('square_leg_v', 0.10)
+        self.declare_parameter('square_leg_1_duration_s', 2.5)
+        self.declare_parameter('square_leg_2_duration_s', 3.0)
 
-        # ── AVOID_RECENTER ────────────────────────────────────────────────
-        self.declare_parameter('avoid_recenter_duration_s', 1.80)
-        self.declare_parameter('avoid_recenter_w', 0.67)
-
-        # ── Hold ─────────────────────────────────────────────────────────
+        # ── goal / hold ───────────────────────────────────────────────────
         self.declare_parameter('hold_required_frames', 10)
 
-        # ── Slew rate / control rate ──────────────────────────────────────
+        # ── slew rate ─────────────────────────────────────────────────────
         self.declare_parameter('control_rate_hz', 10.0)
-        self.declare_parameter('v_slew_rate', 0.20)
-        self.declare_parameter('w_slew_rate', 0.90)
+        self.declare_parameter('v_slew_rate', 0.18)
+        self.declare_parameter('w_slew_rate', 0.80)
 
-        # ── Read parameters ───────────────────────────────────────────────
-        self.image_width  = int(self.get_parameter('image_width').value)
-        center_p          = float(self.get_parameter('image_center_u').value)
-        self.cx           = self.image_width / 2.0 if center_p < 0 else center_p
+        # ── CSV logging ───────────────────────────────────────────────────
+        self.declare_parameter('log_csv', True)
+        self.declare_parameter('log_dir', '/tmp/puzzlebot_logs')
 
-        self.sqrt_area_star   = float(self.get_parameter('sqrt_area_star').value)
-        self.area_db          = float(self.get_parameter('target_area_deadband').value)
-        self.center_db        = float(self.get_parameter('target_center_deadband_px').value)
-        self.kp_w             = float(self.get_parameter('kp_w').value)
-        self.kp_v             = float(self.get_parameter('kp_v').value)
-        self.v_max            = float(self.get_parameter('v_max').value)
-        self.w_max            = float(self.get_parameter('w_max').value)
-        self.v_min_when_far   = float(self.get_parameter('v_min_when_far').value)
-        self.v_stop_band_px   = float(self.get_parameter('v_stop_band_px').value)
+        # ── read parameters ───────────────────────────────────────────────
+        self.image_width = int(self.get_parameter('image_width').value)
+        cx_param = float(self.get_parameter('image_center_u').value)
+        self.cx = self.image_width / 2.0 if cx_param < 0 else cx_param
 
-        self.acquire_w        = float(self.get_parameter('acquire_w').value)
-        self.feature_timeout  = float(self.get_parameter('feature_timeout_s').value)
+        f_px        = float(self.get_parameter('focal_length_px').value)
+        side_m      = float(self.get_parameter('target_real_side_m').value)
+        sqrt_A_real = side_m          # physical side -> same units as sqrt(px^2)
 
-        self.obstacle_enable       = bool(self.get_parameter('obstacle_enable').value)
-        self.obstacle_min_sqrt_area= float(self.get_parameter('obstacle_min_sqrt_area').value)
-        self.obs_center_band_frac  = float(self.get_parameter('obstacle_center_band_frac').value)
-        self.obs_priority_lost     = bool(self.get_parameter('obstacle_priority_over_lost').value)
-        self.avoid_cooldown_s      = float(self.get_parameter('avoid_cooldown_s').value)
+        self.sqrt_area_star = float(self.get_parameter('sqrt_area_star').value)
+        self.area_db        = float(self.get_parameter('target_area_deadband').value)
+        self.center_db      = float(self.get_parameter('target_center_deadband_px').value)
 
-        self.approach_obs_v            = float(self.get_parameter('approach_obs_v').value)
-        self.approach_obs_kp_w         = float(self.get_parameter('approach_obs_kp_w').value)
-        self.approach_obs_sqrt_area    = float(self.get_parameter('approach_obs_sqrt_area').value)
-        self.approach_obs_max_duration = float(self.get_parameter('approach_obs_max_duration_s').value)
+        N    = int(self.get_parameter('mpc_horizon_N').value)
+        dt   = float(self.get_parameter('mpc_dt_s').value)
+        Q_u  = float(self.get_parameter('Q_u').value)
+        Q_A  = float(self.get_parameter('Q_A').value)
+        R_v  = float(self.get_parameter('R_v').value)
+        R_w  = float(self.get_parameter('R_w').value)
+        S_v  = float(self.get_parameter('S_v').value)
+        S_w  = float(self.get_parameter('S_w').value)
 
-        self.avoid_arc_duration  = float(self.get_parameter('avoid_arc_duration_s').value)
-        self.avoid_arc_v         = float(self.get_parameter('avoid_arc_v').value)
-        self.avoid_arc_w         = float(self.get_parameter('avoid_arc_w').value)
+        self.v_max      = float(self.get_parameter('v_max').value)
+        self.w_max      = float(self.get_parameter('w_max').value)
+        k_lin           = float(self.get_parameter('k_lin').value)
+        k_ang           = float(self.get_parameter('k_ang').value)
+        max_couple      = float(self.get_parameter('max_cmd_couple').value)
 
-        self.avoid_recenter_duration = float(self.get_parameter('avoid_recenter_duration_s').value)
-        self.avoid_recenter_w        = float(self.get_parameter('avoid_recenter_w').value)
+        self.acquire_w      = float(self.get_parameter('acquire_w').value)
+        self.feature_timeout_s = float(self.get_parameter('feature_timeout_s').value)
+
+        self.obstacle_enable         = bool(self.get_parameter('obstacle_enable').value)
+        self.obstacle_min_sqrt_area  = float(self.get_parameter('obstacle_min_sqrt_area').value)
+        self.obstacle_center_band_frac = float(self.get_parameter('obstacle_center_band_frac').value)
+        self.obstacle_priority_over_lost = bool(self.get_parameter('obstacle_priority_over_lost').value)
+        self.avoid_cooldown_s        = float(self.get_parameter('avoid_cooldown_s').value)
+
+        self.approach_obs_v           = float(self.get_parameter('approach_obs_v').value)
+        self.approach_obs_kp_w        = float(self.get_parameter('approach_obs_kp_w').value)
+        self.approach_obs_sqrt_area   = float(self.get_parameter('approach_obs_sqrt_area').value)
+        self.approach_obs_max_duration_s = float(self.get_parameter('approach_obs_max_duration_s').value)
+
+        self.square_turn_w            = float(self.get_parameter('square_turn_w').value)
+        self.square_turn_duration_s   = float(self.get_parameter('square_turn_duration_s').value)
+        self.square_leg_v             = float(self.get_parameter('square_leg_v').value)
+        self.square_leg_1_duration_s  = float(self.get_parameter('square_leg_1_duration_s').value)
+        self.square_leg_2_duration_s  = float(self.get_parameter('square_leg_2_duration_s').value)
 
         self.hold_required_frames = int(self.get_parameter('hold_required_frames').value)
-        self.v_slew_rate          = float(self.get_parameter('v_slew_rate').value)
-        self.w_slew_rate          = float(self.get_parameter('w_slew_rate').value)
-        rate                      = float(self.get_parameter('control_rate_hz').value)
+        self.v_slew_rate = float(self.get_parameter('v_slew_rate').value)
+        self.w_slew_rate = float(self.get_parameter('w_slew_rate').value)
+        rate = float(self.get_parameter('control_rate_hz').value)
 
-        # ── Internal state ────────────────────────────────────────────────
-        self.state            = State.ACQUIRE
-        self.target           = None
-        self.obstacle         = None
-        self.last_target_time = None
-        self.last_obs_time    = None
-        self.last_loop_time   = None
-        self.last_v           = 0.0
-        self.last_w           = 0.0
-        self.state_start_time = self.get_clock().now()
-        self.avoid_sign       = 1.0   # +1 arc left, -1 arc right
-        self.hold_counter     = 0
-        self.last_debug       = ''
-        self.last_avoid_end   = None
+        self.log_csv = bool(self.get_parameter('log_csv').value)
+        self.log_dir = self.get_parameter('log_dir').value
+
+        # ── build MPC solver ──────────────────────────────────────────────
+        self.mpc = IBVS_MPC(
+            N=N, dt=dt, f=f_px, cx=self.cx, sqrt_A_real=sqrt_A_real,
+            v_max=self.v_max, omega_max=self.w_max,
+            k_lin=k_lin, k_ang=k_ang, max_cmd_couple=max_couple,
+            Q=np.diag([Q_u, Q_A]),
+            R=np.diag([R_v, R_w]),
+            S=np.diag([S_v, S_w]),
+        )
+
+        # ── internal state ────────────────────────────────────────────────
+        self.state              = State.ACQUIRE
+        self.target             = None
+        self.obstacle           = None
+        self.last_target_time   = None
+        self.last_obstacle_time = None
+        self.last_loop_time     = None
+        self.last_v             = 0.0
+        self.last_w             = 0.0
+        self.state_start_time   = self.get_clock().now()
+        self.avoid_sign         = 1.0
+        self.hold_counter       = 0
+        self.last_debug         = ''
+        self.last_avoid_end_time = None
+
+        # ── CSV logging setup ─────────────────────────────────────────────
+        self._log_rows  = []
+        self._run_start = time_mod.time()
+        self._log_path  = None
+
+        if self.log_csv:
+            os.makedirs(self.log_dir, exist_ok=True)
+            ts = int(self._run_start)
+            self._log_path = os.path.join(self.log_dir, f'run_{ts}.csv')
+            with open(self._log_path, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    't_rel', 'state',
+                    'target_det', 'u_c', 'sqrt_area', 'e_u', 'e_A',
+                    'obs_det', 'obs_sqrt_area', 'obs_u_c',
+                    'danger', 'v_cmd', 'w_cmd'
+                ])
+            self.get_logger().info(f'Logging to: {self._log_path}')
 
         # ── ROS I/O ───────────────────────────────────────────────────────
-        self.create_subscription(TargetFeatures,   '/target_features',
-                                 self.cb_target,   10)
-        self.create_subscription(ObstacleFeatures, '/obstacle_features',
-                                 self.cb_obstacle, 10)
+        self.create_subscription(
+            TargetFeatures,  '/target_features',   self.cb_target,   10)
+        self.create_subscription(
+            ObstacleFeatures,'/obstacle_features', self.cb_obstacle, 10)
 
-        self.pub_cmd   = self.create_publisher(Twist,  '/cmd_vel',     10)
-        self.pub_state = self.create_publisher(String, '/vs_state',    10)
-        self.pub_debug = self.create_publisher(String, '/avoid_debug', 10)
+        self.pub_cmd   = self.create_publisher(Twist,  '/cmd_vel',    10)
+        self.pub_state = self.create_publisher(String, '/vs_state',   10)
+        self.pub_debug = self.create_publisher(String, '/avoid_debug',10)
 
         self.create_timer(1.0 / rate, self.step)
 
         self.get_logger().info(
-            f'SafeVSController ready | '
-            f'cx={self.cx:.0f}px | sqrt_A*={self.sqrt_area_star:.0f} | '
-            f'obs_trigger={self.obstacle_min_sqrt_area:.0f} | '
-            f'approach_target={self.approach_obs_sqrt_area:.0f}'
+            f'Safe VS controller (IBVS-MPC) | N={N} dt={dt}s | '
+            f'cx={self.cx:.1f} f={f_px:.1f}px | '
+            f'sqrt_area_star={self.sqrt_area_star:.1f} | '
+            f'obs_trigger={self.obstacle_min_sqrt_area:.1f}'
         )
 
-    # ── Callbacks ─────────────────────────────────────────────────────────
+    # ── callbacks ─────────────────────────────────────────────────────────
 
     def cb_target(self, msg):
         self.target = msg
@@ -235,163 +421,135 @@ class SafeVSController(Node):
 
     def cb_obstacle(self, msg):
         self.obstacle = msg
-        self.last_obs_time = self.get_clock().now()
+        self.last_obstacle_time = self.get_clock().now()
 
-    # ── Time helpers ──────────────────────────────────────────────────────
+    # ── time helpers ──────────────────────────────────────────────────────
 
-    def _age(self, stamp):
+    def age_s(self, stamp):
         if stamp is None:
             return None
         return (self.get_clock().now() - stamp).nanoseconds * 1e-9
 
-    def _state_elapsed(self):
+    def state_elapsed_s(self):
         return (self.get_clock().now() - self.state_start_time).nanoseconds * 1e-9
 
-    def _set_state(self, new_state):
+    def set_state(self, new_state):
         if new_state != self.state:
-            self.get_logger().info(f'FSM: {self.state.name} -> {new_state.name}')
-            self.state            = new_state
+            self.get_logger().info(f'{self.state.name} -> {new_state.name}')
+            self.state = new_state
             self.state_start_time = self.get_clock().now()
-            self.hold_counter     = 0
+            self.hold_counter = 0
 
-    def _cooldown_active(self):
-        if self.last_avoid_end is None:
+    def cooldown_active(self):
+        if self.last_avoid_end_time is None:
             return False
-        return (self.get_clock().now() - self.last_avoid_end
-                ).nanoseconds * 1e-9 < self.avoid_cooldown_s
+        return (
+            self.get_clock().now() - self.last_avoid_end_time
+        ).nanoseconds * 1e-9 < self.avoid_cooldown_s
 
-    # ── Feature checks ────────────────────────────────────────────────────
+    # ── feature checks ────────────────────────────────────────────────────
 
-    def _target_fresh(self):
-        """True when a green target is actively detected."""
+    def target_fresh(self):
         if self.target is None:
             return False
-        age = self._age(self.last_target_time)
-        return age is not None and age <= self.feature_timeout and bool(self.target.detected)
+        age = self.age_s(self.last_target_time)
+        if age is None or age > self.feature_timeout_s:
+            return False
+        return bool(self.target.detected)
 
-    def _obstacle_fresh(self):
-        """True when a blue obstacle is actively detected."""
+    def obstacle_fresh(self):
         if self.obstacle is None:
             return False
-        age = self._age(self.last_obs_time)
-        return age is not None and age <= self.feature_timeout and bool(self.obstacle.detected)
+        age = self.age_s(self.last_obstacle_time)
+        if age is None or age > self.feature_timeout_s:
+            return False
+        return bool(self.obstacle.detected)
 
-    def _obstacle_danger(self):
-        """
-        Return (danger: bool, reason: str).
-
-        Danger requires:
-          1. Obstacle detected and fresh.
-          2. Apparent size >= obstacle_min_sqrt_area  (close enough).
-          3. Centroid within the center band          (directly ahead).
-          4. No cooldown active.
-        """
+    def obstacle_danger(self):
         if not self.obstacle_enable:
-            return False, 'disabled'
-        if self._cooldown_active():
-            return False, 'cooldown'
-        if not self._obstacle_fresh():
+            return False, 'obstacle disabled'
+        if self.cooldown_active():
+            return False, 'cooldown active'
+        if not self.obstacle_fresh():
             return False, 'blue not visible'
 
-        sa  = float(self.obstacle.sqrt_area)
-        u   = float(self.obstacle.u_c)
+        sqrt_area = float(self.obstacle.sqrt_area)
+        obs_u     = float(self.obstacle.u_c)
 
-        if sa < self.obstacle_min_sqrt_area:
-            return False, f'too small {sa:.0f}<{self.obstacle_min_sqrt_area:.0f}'
+        if sqrt_area < self.obstacle_min_sqrt_area:
+            return False, f'blue too small {sqrt_area:.1f} < {self.obstacle_min_sqrt_area:.1f}'
 
-        half = 0.5 * self.obs_center_band_frac * self.image_width
-        if abs(u - self.cx) > half:
-            return False, f'outside band u={u:.0f}'
+        half_band = 0.5 * self.obstacle_center_band_frac * self.image_width
+        if abs(obs_u - self.cx) > half_band:
+            return False, f'blue outside band u={obs_u:.1f}'
 
-        return True, f'DANGER sa={sa:.0f} u={u:.0f}'
+        return True, f'DANGER sqrt_A={sqrt_area:.1f}'
 
-    def _compute_avoid_sign(self):
-        """
-        Decide arc direction from obstacle lateral position.
-        Obstacle on the right -> arc left (+1).
-        Obstacle on the left  -> arc right (-1).
-        """
-        if not self._obstacle_fresh():
+    def compute_avoid_sign(self):
+        if not self.obstacle_fresh():
             return 1.0
         return 1.0 if float(self.obstacle.u_c) > self.cx else -1.0
 
-    def _at_goal(self):
-        if not self._target_fresh():
+    def at_goal(self):
+        if not self.target_fresh():
             return False
-        return (abs(float(self.target.u_c) - self.cx)    < self.center_db and
-                abs(float(self.target.sqrt_area) - self.sqrt_area_star) < self.area_db)
+        return (
+            abs(float(self.target.u_c) - self.cx) < self.center_db
+            and abs(float(self.target.sqrt_area) - self.sqrt_area_star) < self.area_db
+        )
 
-    # ── Control laws ──────────────────────────────────────────────────────
+    # ── control laws ──────────────────────────────────────────────────────
 
-    def _servo_command(self):
+    def mpc_command(self):
         """
-        Proportional IBVS control law toward the green target.
+        Compute the optimal velocity command using the IBVS-MPC solver.
 
-        Angular command: w = -kp_w * e_u   (center target horizontally)
-        Linear command:  v = kp_v * e_A    (approach until desired size)
-
-        Centering-scale coupling (eliminates wave motion):
-          When |e_u| > v_stop_band_px, v = 0 (pure rotation only).
-          When |e_u| <= v_stop_band_px, v is scaled linearly from 0 to full.
-          This prevents the robot from driving forward while still off-center.
+        At each call the QP is solved over the N-step horizon. Only the
+        first command of the optimal sequence is returned and applied
+        (receding horizon principle). The previous published command is
+        passed as u_prev so the slew term S in the cost function is
+        evaluated correctly.
         """
-        e_u = float(self.target.u_c) - self.cx
-        e_A = self.sqrt_area_star - float(self.target.sqrt_area)
+        s_now  = [float(self.target.u_c),     float(self.target.sqrt_area)]
+        s_star = [self.cx,                     self.sqrt_area_star]
+        u_prev = [self.last_v,                 self.last_w]
+        v_cmd, w_cmd = self.mpc.solve(s_now, s_star, u_prev)
+        return v_cmd, w_cmd
 
-        w = -self.kp_w * e_u
-
-        v = self.kp_v * e_A if e_A > self.area_db else 0.0
-        if e_A > self.area_db:
-            v = max(v, self.v_min_when_far)
-
-        # Centering-scale: zero v outside band, linear ramp inside
-        if abs(e_u) > self.v_stop_band_px:
-            v = 0.0
-        else:
-            v = v * (1.0 - abs(e_u) / self.v_stop_band_px)
-
-        return clip(v, 0.0, self.v_max), clip(w, -self.w_max, self.w_max)
-
-    def _approach_command(self):
-        """
-        Slow advance toward the blue obstacle with simultaneous centering.
-
-        Forward speed is fixed (not scaled by centering error) so the robot
-        always moves toward the obstacle even when it is not perfectly centered.
-        The angular command handles centering in parallel.
-        """
-        e_obs_u = float(self.obstacle.u_c) - self.cx
+    def approach_command(self):
+        """Slow approach toward the blue obstacle while centering it."""
+        obs_u   = float(self.obstacle.u_c)
+        e_obs_u = obs_u - self.cx
         w = -self.approach_obs_kp_w * e_obs_u
         v = self.approach_obs_v
-        return clip(v, 0.0, self.approach_obs_v), clip(w, -self.w_max, self.w_max)
+        v = clip(v, 0.0, self.approach_obs_v)
+        w = clip(w, -self.w_max, self.w_max)
+        return v, w
 
-    # ── Publish helpers ───────────────────────────────────────────────────
+    # ── publish ───────────────────────────────────────────────────────────
 
-    def _publish_cmd(self, v_des, w_des, dt, force_zero_v=False):
-        """Apply slew-rate limiting and publish /cmd_vel."""
+    def publish_cmd(self, v_des, w_des, dt, force_zero_v=False):
         if force_zero_v:
             v = 0.0
             self.last_v = 0.0
         else:
-            dv = self.v_slew_rate * dt
-            v  = clip(v_des, self.last_v - dv, self.last_v + dv)
+            max_dv = self.v_slew_rate * dt
+            v = clip(v_des, self.last_v - max_dv, self.last_v + max_dv)
             self.last_v = v
-
-        dw = self.w_slew_rate * dt
-        w  = clip(w_des, self.last_w - dw, self.last_w + dw)
+        max_dw = self.w_slew_rate * dt
+        w = clip(w_des, self.last_w - max_dw, self.last_w + max_dw)
         self.last_w = w
-
         msg = Twist()
         msg.linear.x  = float(v)
         msg.angular.z = float(w)
         self.pub_cmd.publish(msg)
 
-    def _publish_state(self):
+    def publish_state(self):
         msg = String()
         msg.data = self.state.name
         self.pub_state.publish(msg)
 
-    def _publish_debug(self, text):
+    def publish_debug(self, text):
         msg = String()
         msg.data = text
         self.pub_debug.publish(msg)
@@ -399,7 +557,41 @@ class SafeVSController(Node):
             self.get_logger().info(f'[debug] {text}')
             self.last_debug = text
 
-    # ── Main control loop ─────────────────────────────────────────────────
+    # ── CSV logging ───────────────────────────────────────────────────────
+
+    def _log_tick(self, danger):
+        if not self.log_csv:
+            return
+        t_rel = time_mod.time() - self._run_start
+        if self.target is not None and bool(self.target.detected):
+            tdet, tu, tsa = 1, float(self.target.u_c), float(self.target.sqrt_area)
+        else:
+            tdet, tu, tsa = 0, 0.0, 0.0
+        e_u = tu - self.cx if tdet else 0.0
+        e_A = self.sqrt_area_star - tsa if tdet else 0.0
+        if self.obstacle is not None and bool(self.obstacle.detected):
+            odet, osa, ou = 1, float(self.obstacle.sqrt_area), float(self.obstacle.u_c)
+        else:
+            odet, osa, ou = 0, 0.0, 0.0
+        self._log_rows.append([
+            f'{t_rel:.3f}', self.state.name,
+            tdet, f'{tu:.1f}', f'{tsa:.1f}',
+            f'{e_u:.1f}', f'{e_A:.1f}',
+            odet, f'{osa:.1f}', f'{ou:.1f}',
+            int(danger), f'{self.last_v:.4f}', f'{self.last_w:.4f}'
+        ])
+        if len(self._log_rows) >= 50:
+            self._flush_log()
+
+    def _flush_log(self):
+        if not self._log_rows or self._log_path is None:
+            return
+        with open(self._log_path, 'a', newline='') as f:
+            w = csv.writer(f)
+            w.writerows(self._log_rows)
+        self._log_rows.clear()
+
+    # ── main FSM loop ─────────────────────────────────────────────────────
 
     def step(self):
         now = self.get_clock().now()
@@ -412,131 +604,132 @@ class SafeVSController(Node):
         if dt <= 0.0 or dt > 0.5:
             return
 
-        v_des       = 0.0
-        w_des       = 0.0
-        force_zero  = False
+        v_des = 0.0
+        w_des = 0.0
+        force_zero_v = False
+        elapsed = self.state_elapsed_s()
 
-        danger, dreason = self._obstacle_danger()
-        target_ok       = self._target_fresh()
+        danger, danger_reason = self.obstacle_danger()
+        target_ok = self.target_fresh()
 
         # ── ACQUIRE ───────────────────────────────────────────────────────
         if self.state == State.ACQUIRE:
             if target_ok:
-                self._set_state(State.SERVO)
+                self.set_state(State.SERVO)
             else:
                 w_des = self.acquire_w
 
-        # ── SERVO ─────────────────────────────────────────────────────────
+        # ── SERVO — MPC command ───────────────────────────────────────────
         elif self.state == State.SERVO:
             if danger:
                 self.last_v = 0.0
-                self._set_state(State.PRE_AVOID_STOP)
-
+                self.set_state(State.PRE_AVOID_STOP)
             elif not target_ok:
-                self._set_state(State.LOST)
-
-            elif self._at_goal():
+                self.set_state(State.LOST)
+            elif self.at_goal():
                 self.hold_counter += 1
                 if self.hold_counter >= self.hold_required_frames:
-                    self._set_state(State.HOLD)
-
+                    self.set_state(State.HOLD)
             else:
                 self.hold_counter = 0
-                v_des, w_des = self._servo_command()
+                v_des, w_des = self.mpc_command()    # ← IBVS-MPC
 
         # ── PRE_AVOID_STOP ────────────────────────────────────────────────
         elif self.state == State.PRE_AVOID_STOP:
-            force_zero = True
-            if self._state_elapsed() >= 0.45:
-                self._set_state(State.APPROACH_OBSTACLE)
+            force_zero_v = True
+            if elapsed >= 0.45:
+                self.set_state(State.APPROACH_OBSTACLE)
 
         # ── APPROACH_OBSTACLE ─────────────────────────────────────────────
-        # Robot centers the obstacle and approaches slowly until the obstacle
-        # apparent size reaches approach_obs_sqrt_area, establishing a known,
-        # consistent starting distance for the arc.
         elif self.state == State.APPROACH_OBSTACLE:
-
-            timed_out = self._state_elapsed() >= self.approach_obs_max_duration
-
-            if not self._obstacle_fresh():
-                # Obstacle left FOV — proceed with last known direction
-                self.get_logger().warn('APPROACH: obstacle lost, firing arc anyway.')
-                self.avoid_sign = self._compute_avoid_sign()
-                self._set_state(State.AVOID_ARC)
-
-            elif timed_out:
-                self.get_logger().warn('APPROACH: timeout, firing arc.')
-                self.avoid_sign = self._compute_avoid_sign()
-                self._set_state(State.AVOID_ARC)
-
+            if not self.obstacle_fresh():
+                self.get_logger().warn('APPROACH: obstacle lost, starting bypass.')
+                self.avoid_sign = self.compute_avoid_sign()
+                self.set_state(State.SQ_TURN_1)
+            elif elapsed >= self.approach_obs_max_duration_s:
+                self.get_logger().warn('APPROACH: timeout, starting bypass.')
+                self.avoid_sign = self.compute_avoid_sign()
+                self.set_state(State.SQ_TURN_1)
             elif float(self.obstacle.sqrt_area) >= self.approach_obs_sqrt_area:
-                # Good visual fix obtained — compute direction and fire arc
-                self.avoid_sign = self._compute_avoid_sign()
+                self.avoid_sign = self.compute_avoid_sign()
                 self.get_logger().info(
-                    f'APPROACH: target reached sa={self.obstacle.sqrt_area:.0f} '
-                    f'sign={self.avoid_sign:+.0f}'
-                )
-                self._set_state(State.AVOID_ARC)
-
+                    f'APPROACH: reached target sqrt_area={self.obstacle.sqrt_area:.1f} '
+                    f'avoid_sign={self.avoid_sign:+.0f}')
+                self.set_state(State.SQ_TURN_1)
             else:
-                # Still approaching
-                v_des, w_des = self._approach_command()
-                dreason = (f'approaching obs | '
-                           f'sa={float(self.obstacle.sqrt_area):.0f}'
-                           f'/{self.approach_obs_sqrt_area:.0f}')
+                v_des, w_des = self.approach_command()
+                danger_reason = (
+                    f'approaching | '
+                    f'sqrt_area={self.obstacle.sqrt_area:.1f}'
+                    f'/{self.approach_obs_sqrt_area:.1f}'
+                )
 
-        # ── AVOID_ARC ─────────────────────────────────────────────────────
-        elif self.state == State.AVOID_ARC:
-            v_des = self.avoid_arc_v
-            w_des = self.avoid_sign * self.avoid_arc_w
-            if self._state_elapsed() >= self.avoid_arc_duration:
-                self._set_state(State.AVOID_RECENTER)
+        # ── SQ_TURN_1 ─────────────────────────────────────────────────────
+        elif self.state == State.SQ_TURN_1:
+            w_des = self.avoid_sign * self.square_turn_w
+            force_zero_v = True
+            if elapsed >= self.square_turn_duration_s:
+                self.set_state(State.SQ_LEG_1)
 
-        # ── AVOID_RECENTER ────────────────────────────────────────────────
-        elif self.state == State.AVOID_RECENTER:
-            w_des      = -self.avoid_sign * self.avoid_recenter_w
-            force_zero = True
-            if self._state_elapsed() >= self.avoid_recenter_duration:
-                self.last_avoid_end = self.get_clock().now()
-                self._set_state(State.REACQUIRE)
+        # ── SQ_LEG_1 ──────────────────────────────────────────────────────
+        elif self.state == State.SQ_LEG_1:
+            v_des = self.square_leg_v
+            w_des = 0.0
+            if elapsed >= self.square_leg_1_duration_s:
+                self.set_state(State.SQ_TURN_2)
+
+        # ── SQ_TURN_2 ─────────────────────────────────────────────────────
+        elif self.state == State.SQ_TURN_2:
+            w_des = -self.avoid_sign * self.square_turn_w
+            force_zero_v = True
+            if elapsed >= self.square_turn_duration_s:
+                self.set_state(State.SQ_LEG_2)
+
+        # ── SQ_LEG_2 ──────────────────────────────────────────────────────
+        elif self.state == State.SQ_LEG_2:
+            v_des = self.square_leg_v
+            w_des = 0.0
+            if elapsed >= self.square_leg_2_duration_s:
+                self.last_avoid_end_time = self.get_clock().now()
+                self.set_state(State.REACQUIRE)
 
         # ── REACQUIRE ─────────────────────────────────────────────────────
         elif self.state == State.REACQUIRE:
             if target_ok:
-                self._set_state(State.SERVO)
+                self.set_state(State.SERVO)
             else:
                 w_des = self.acquire_w
 
         # ── LOST ──────────────────────────────────────────────────────────
         elif self.state == State.LOST:
-            if self.obs_priority_lost and danger:
+            if self.obstacle_priority_over_lost and danger:
                 self.last_v = 0.0
-                self._set_state(State.PRE_AVOID_STOP)
+                self.set_state(State.PRE_AVOID_STOP)
             elif target_ok:
-                self._set_state(State.SERVO)
+                self.set_state(State.SERVO)
             else:
                 w_des = self.acquire_w
 
         # ── HOLD ──────────────────────────────────────────────────────────
         elif self.state == State.HOLD:
-            force_zero = True
+            force_zero_v = True
 
-        # ── Publish ───────────────────────────────────────────────────────
-        self._publish_cmd(v_des, w_des, dt, force_zero_v=force_zero)
-        self._publish_state()
+        # ── publish + log ─────────────────────────────────────────────────
+        self.publish_cmd(v_des, w_des, dt, force_zero_v=force_zero_v)
+        self.publish_state()
 
-        obs_sa = (f'{float(self.obstacle.sqrt_area):.0f}'
-                  if self._obstacle_fresh() else 'none')
-
-        self._publish_debug(
+        obs_str = f'{float(self.obstacle.sqrt_area):.1f}' if self.obstacle_fresh() else 'none'
+        self.publish_debug(
             f'state={self.state.name} | target={target_ok} | '
-            f'danger={danger} | obs_sa={obs_sa} | {dreason}'
+            f'danger={danger} | obs={obs_str} | t={elapsed:.1f}s | {danger_reason}'
         )
 
+        self._log_tick(danger)
 
-# ---------------------------------------------------------------------------
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Entry point
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main(args=None):
     rclpy.init(args=args)
@@ -552,6 +745,7 @@ def main(args=None):
                 node.pub_cmd.publish(stop)
         except Exception:
             pass
+        node._flush_log()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
